@@ -1,0 +1,45 @@
+# CPU-only torch/torchvision builds — smaller download, and this product
+# never needs GPU hosting (see plan's Zero-Cost Constraint: CPU inference
+# with YOLOX-Nano is sufficient and avoids paid GPU hosting entirely).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Web API
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Detection & tracking (Apache-2.0 / MIT — safe for closed-source commercial use;
+# do NOT replace with Ultralytics YOLOv8, which is AGPL-3.0)
+torch
+torchvision
+opencv-python-headless
+numpy
+scipy
+
+# Queue
+redis
+rq
+
+# Sync worker (edge -> central HTTP push)
+requests
+
+# Storage
+sqlalchemy
+psycopg[binary]
+boto3  # S3-compatible client, works against MinIO and Cloudflare R2
+
+# Config / util
+pydantic
+pydantic-settings
+watchdog  # local-folder watcher for edge-mode ingestion
+
+# Testing
+pytest
+httpx  # FastAPI TestClient
+
+# yolox itself is installed separately with --no-deps in the Dockerfile:
+# its setup.py pulls in a fragile dependency chain (onnx, pycocotools,
+# scikit-image, tensorboard — all training/export tooling this product
+# never uses for inference) that isn't needed and has caused build failures
+# in practice (onnx requiring cmake). loguru and thop are the only two of
+# its declared dependencies actually imported by the inference code path.

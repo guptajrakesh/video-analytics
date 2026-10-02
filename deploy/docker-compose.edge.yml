@@ -1,0 +1,130 @@
+# Edge-mode deployment: runs entirely inside a client's own network/server.
+# Point LOCAL_VIDEO_FOLDER at wherever the client's NVR/server already
+# writes recordings (a local path, or a mounted SMB/NFS share) and
+# CENTRAL_API_URL at the cloud deployment's API — only aggregated results
+# cross that boundary, never raw video (see plan's "Deployment Modes").
+services:
+  postgres:
+    image: postgres:16-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d video_analytics"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    environment:
+      POSTGRES_DB: video_analytics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ../backend
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/video_analytics
+      REDIS_URL: redis://redis:6379/0
+      REFERENCE_FRAME_DIR: /data/frames
+    volumes:
+      - frames_data:/data/frames
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../backend
+    command: python -m pipeline.run
+    restart: unless-stopped
+    environment:
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_WEBHOOK_FORMAT: ${ALERT_WEBHOOK_FORMAT:-generic}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/video_analytics
+      REDIS_URL: redis://redis:6379/0
+      REFERENCE_FRAME_DIR: /data/frames
+    volumes:
+      - ${LOCAL_VIDEO_FOLDER:-./local_videos}:/data/watch_folder:ro
+      - frames_data:/data/frames
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  folder_watcher:
+    build:
+      context: ../backend
+    command: python -m ingestion.folder_watcher_main
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WATCH_FOLDER: /data/watch_folder
+      CAMERA_ID: ${EDGE_CAMERA_ID:-edge-cam-1}
+      WATCHER_STATE_PATH: /data/state/watcher.json
+    volumes:
+      - ${LOCAL_VIDEO_FOLDER:-./local_videos}:/data/watch_folder:ro
+      - watcher_state:/data/state
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # RTSP ingestion for edge mode uses the same image/module as cloud mode —
+  # point RTSP_URL at the client's own camera, which never needs to leave
+  # their network since this whole stack runs on their server.
+  rtsp_grabber:
+    build:
+      context: ../backend
+    command: python -m ingestion.rtsp_grabber_main
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RTSP_URL: ${RTSP_URL:-}
+      CAMERA_ID: ${RTSP_CAMERA_ID:-edge-cam-rtsp-1}
+      SEGMENT_SECONDS: "30"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["rtsp"]
+
+  # Pushes each processed video's derived rows (tracks, footfall/zone events,
+  # position samples) to the central API — never the video file. Optional:
+  # omit CENTRAL_API_URL to run a fully standalone edge deployment where
+  # results are only queried locally.
+  sync_worker:
+    build:
+      context: ../backend
+    command: python -m sync.push_main
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/video_analytics
+      CENTRAL_API_URL: ${CENTRAL_API_URL:-}
+      SYNC_INTERVAL_SECONDS: "60"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["sync"]
+
+volumes:
+  postgres_data:
+  frames_data:
+  watcher_state:

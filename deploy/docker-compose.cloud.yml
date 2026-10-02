@@ -1,0 +1,127 @@
+# Cloud-mode deployment: full stack on our own infrastructure.
+# Free-tier target: a single Oracle Cloud "Always Free" VM can run all of
+# these services together (see plan's Zero-Cost Constraint section).
+services:
+  postgres:
+    image: postgres:16-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d video_analytics"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    environment:
+      POSTGRES_DB: video_analytics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+
+  api:
+    build:
+      context: ../backend
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/video_analytics
+      REDIS_URL: redis://redis:6379/0
+      VIDEO_STORAGE_ROOT: /data/uploads
+      REFERENCE_FRAME_DIR: /data/uploads/reference_frames
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${DASHBOARD_PORT:-5173}}
+    volumes:
+      - uploads_data:/data/uploads
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../backend
+    command: python -m pipeline.run
+    restart: unless-stopped
+    environment:
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_WEBHOOK_FORMAT: ${ALERT_WEBHOOK_FORMAT:-generic}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/video_analytics
+      REDIS_URL: redis://redis:6379/0
+      VIDEO_STORAGE_ROOT: /data/uploads
+      REFERENCE_FRAME_DIR: /data/uploads/reference_frames
+    volumes:
+      - uploads_data:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # One rtsp_grabber per camera in a real multi-camera deployment — this is
+  # a template instance; add more services (rtsp_grabber_2, etc.) or run
+  # `docker compose run` per camera with different RTSP_URL/CAMERA_ID.
+  rtsp_grabber:
+    build:
+      context: ../backend
+    command: python -m ingestion.rtsp_grabber_main
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      VIDEO_STORAGE_ROOT: /data/uploads
+      REFERENCE_FRAME_DIR: /data/uploads/reference_frames
+      RTSP_URL: ${RTSP_URL:-}
+      CAMERA_ID: ${RTSP_CAMERA_ID:-cam-rtsp-1}
+      SEGMENT_SECONDS: "30"
+    volumes:
+      - uploads_data:/data/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["rtsp"]  # only started when explicitly requested (`--profile rtsp`), since most demos won't have a live camera
+
+  # Static dashboard. PUBLIC_API_URL is the address the *browser* uses to
+  # reach the API (baked in at build time), not the in-network address.
+  dashboard:
+    build:
+      context: ../dashboard
+      args:
+        VITE_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "${DASHBOARD_PORT:-5173}:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  minio_data:
+  uploads_data:
